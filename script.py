@@ -15,59 +15,82 @@ SIDEBAR_SELECTOR = "#sidebar"
 CA_ZIP_MIN = 90000
 CA_ZIP_MAX = 96199
 
-ADDRESS_LINE_RE = re.compile(
-    r"""
-    ^\s*
-    \d{1,8}
-    [^,\n]{2,160}
-    ,\s*
-    [A-Za-z0-9 .'\-]{2,80}
-    ,\s*
-    CA\s*
-    \d{5}(?:-\d{4})?
-    \s*$
-    """,
-    re.VERBOSE,
+ZIP_ANCHOR = re.compile(r"\bCA\s+9\d{4}(?:-\d{4})?\b", re.IGNORECASE)
+MILES_ANYWHERE = re.compile(r"\(\s*\d+(\.\d+)?\s*\)\s*miles?\.?", re.IGNORECASE)
+PHONE_ANYWHERE = re.compile(r"Phone:\s*\(\d{3}\)\s*\d{3}-\d{4}", re.IGNORECASE)
+GET_DIRECTIONS_ANYWHERE = re.compile(r"Get\s+Directions\s*", re.IGNORECASE)
+
+ADDRESS_EXTRACT = re.compile(
+    r"(\d{1,8}\s+.+?,\s*[^,]+?,\s*CA\s+9\d{4}(?:-\d{4})?)",
+    re.IGNORECASE,
 )
-CA_ZIP_RE = re.compile(r"\bCA\s+\d{5}(?:-\d{4})?\b")
 
 
-def generate_ca_zip_seeds(step: int = 25, jitter: bool = True) -> List[str]:
+def generate_ca_zip_seeds(step: int, jitter: bool) -> List[str]:
     start = CA_ZIP_MIN + (step // 2) if jitter else CA_ZIP_MIN
     return [f"{z:05d}" for z in range(start, CA_ZIP_MAX + 1, step)]
 
 
-def extract_ca_addresses(sidebar_text: str) -> List[str]:
-    lines = [ln.strip() for ln in sidebar_text.splitlines() if ln.strip()]
+def norm(s: str) -> str:
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+,", ",", s)
+    s = re.sub(r",\s+", ", ", s)
+    return s
+
+
+def extract_address_only(line_or_block: str) -> Optional[str]:
+    s = norm(line_or_block)
+    s = GET_DIRECTIONS_ANYWHERE.sub("", s)
+    s = MILES_ANYWHERE.sub("", s)
+    s = PHONE_ANYWHERE.sub("", s)
+    s = norm(s)
+
+    m = ADDRESS_EXTRACT.search(s)
+    if m:
+        return norm(m.group(1))
+
+    if ZIP_ANCHOR.search(s) and re.search(r"\d", s):
+        idx = s.lower().rfind(", ca ")
+        if idx != -1:
+            return norm(s[:].strip())
+
+    return None
+
+
+def extract_unique_addresses(sidebar_text: str) -> List[str]:
+    raw_lines = [ln.strip() for ln in sidebar_text.splitlines() if ln.strip()]
+    cleaned_lines = [norm(ln) for ln in raw_lines]
+
     out: List[str] = []
 
-    for ln in lines:
-        if ADDRESS_LINE_RE.match(ln):
-            out.append(ln)
+    for ln in cleaned_lines:
+        if ZIP_ANCHOR.search(ln):
+            a = extract_address_only(ln)
+            if a:
+                out.append(a)
 
     block: List[str] = []
-    for ln in lines:
+    for ln in cleaned_lines:
         block.append(ln)
-        if CA_ZIP_RE.search(ln):
-            for k in (1, 2, 3, 4):
+        if len(block) > 5:
+            block = block[-5:]
+        if ZIP_ANCHOR.search(ln):
+            for k in (2, 3, 4, 5):
                 if len(block) >= k:
                     cand = " ".join(block[-k:])
-                    cand = re.sub(r"\s+", " ", cand).strip()
-                    if ADDRESS_LINE_RE.match(cand):
-                        out.append(cand)
+                    a = extract_address_only(cand)
+                    if a:
+                        out.append(a)
                         break
-            block = []
-        if len(block) > 8:
-            block = block[-4:]
 
-    seen_local = set()
-    normed = []
+    seen = set()
+    uniq = []
     for a in out:
-        a2 = re.sub(r"\s+", " ", a).strip()
-        if a2 not in seen_local:
-            seen_local.add(a2)
-            normed.append(a2)
-    return normed
+        a2 = norm(a)
+        if a2 and a2 not in seen:
+            seen.add(a2)
+            uniq.append(a2)
+    return uniq
 
 
 async def accept_common_banners(page: Page) -> None:
@@ -103,57 +126,50 @@ async def sidebar_snapshot(frame: Frame) -> str:
         return ""
 
 
-async def wait_sidebar_change(frame: Frame, before: str, timeout_ms: int = 15000) -> str:
+async def wait_sidebar_change(frame: Frame, before: str, timeout_ms: int = 12000) -> str:
     deadline = frame.page.context._loop.time() + timeout_ms / 1000.0
     while frame.page.context._loop.time() < deadline:
         now = await sidebar_snapshot(frame)
         if now and now != (before or ""):
             return now
-        await frame.wait_for_timeout(200)
+        await frame.wait_for_timeout(120)
     return await sidebar_snapshot(frame)
 
 
-async def trigger_search(frame: Frame) -> None:
-    ok = False
+async def trigger_search_fast(frame: Frame) -> None:
     try:
-        ok = await frame.evaluate("() => (typeof searchLocations === 'function')")
+        has_fn = await frame.evaluate("() => (typeof searchLocations === 'function')")
     except Exception:
-        ok = False
+        has_fn = False
 
-    if ok:
+    if has_fn:
         await frame.evaluate("() => { searchLocations(); }")
     else:
         await frame.wait_for_selector(BUTTON_SELECTOR, timeout=15000)
-        await frame.click(BUTTON_SELECTOR)
+        await frame.evaluate(
+            """() => {
+                const btn = document.querySelector('input[type="button"][value="Find Providers"]');
+                if (btn) btn.click();
+            }"""
+        )
 
 
-async def set_query_and_search(frame: Frame, query: str) -> str:
-    """
-    Deterministic submit:
-      - ensure radius=50
-      - type query
-      - wait until input.value matches query (using arg=)
-      - trigger_search
-      - wait for sidebar change
-    Returns: 'ok' or 'failed'
-    """
+async def set_query_and_search_fast(frame: Frame, query: str) -> str:
     await ensure_radius_50(frame)
-
     before = await sidebar_snapshot(frame)
 
-    await frame.fill(INPUT_SELECTOR, "")
-    await frame.type(INPUT_SELECTOR, query, delay=20)
-
-    await frame.wait_for_function(
-        """(v) => {
+    await frame.evaluate(
+        """(q) => {
             const el = document.querySelector('#addressInput');
-            return el && el.value && el.value.trim() === v;
+            if (!el) return;
+            el.value = q;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
         }""",
         arg=query,
-        timeout=5000,
     )
 
-    await trigger_search(frame)
+    await trigger_search_fast(frame)
     after = await wait_sidebar_change(frame, before, timeout_ms=12000)
     return "ok" if after and after != before else "failed"
 
@@ -194,8 +210,8 @@ async def run(
         await ensure_radius_50(frame)
 
         print(f"Output CSV: {out_path}")
-        print(f"CA ZIP seeds: {len(zips)} (range {CA_ZIP_MIN}-{CA_ZIP_MAX}, step={zip_step})")
-        print(f"Existing CA addresses loaded: {len(seen)}")
+        print(f"CA ZIP seeds: {len(zips)} (step={zip_step})")
+        print(f"Existing addresses loaded: {len(seen)}")
 
         for i, z in enumerate(zips):
             if max_queries is not None and i >= max_queries:
@@ -209,27 +225,29 @@ async def run(
                 await frame.wait_for_selector(INPUT_SELECTOR, timeout=30000)
                 await ensure_radius_50(frame)
 
-            mode1 = await set_query_and_search(frame, z)
+            mode1 = await set_query_and_search_fast(frame, z)
+            mode = "zip" if mode1 == "ok" else "failed"
+
             if mode1 == "failed":
-                mode2 = await set_query_and_search(frame, f"{z}, CA")
+                mode2 = await set_query_and_search_fast(frame, f"{z}, CA")
                 mode = "zip_ca" if mode2 == "ok" else "failed"
-            else:
-                mode = "zip"
 
             sidebar_text = await sidebar_snapshot(frame)
-            addrs = extract_ca_addresses(sidebar_text) if sidebar_text else []
+            addrs = extract_unique_addresses(sidebar_text) if sidebar_text else []
             new_addrs = [a for a in addrs if a not in seen]
 
             if new_addrs:
                 with out_path.open("a", encoding="utf-8") as f:
                     for a in new_addrs:
-                        a_clean = a.replace("\n", " ").replace("\r", " ").strip()
+                        a_clean = norm(a)
                         f.write(a_clean + "\n")
                         seen.add(a_clean)
                         print(f"NEW: {a_clean}")
 
-            print(f"[{i+1}] zip={z} mode={mode} ca_results={len(addrs)} unique={len(seen)} +{len(new_addrs)}")
-            await page.wait_for_timeout(delay_ms)
+            print(f"[{i+1}] zip={z} mode={mode} found={len(addrs)} unique={len(seen)} +{len(new_addrs)}")
+
+            if delay_ms > 0:
+                await page.wait_for_timeout(delay_ms)
 
         await browser.close()
 
@@ -240,10 +258,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="ca_unique_addresses.csv")
     ap.add_argument("--headful", action="store_true")
-    ap.add_argument("--delay_ms", type=int, default=450)
-    ap.add_argument("--max_queries", type=int, default=0, help="0 means no limit.")
-    ap.add_argument("--zip_step", type=int, default=25)
-    ap.add_argument("--reload_every", type=int, default=20)
+    ap.add_argument("--delay_ms", type=int, default=150)
+    ap.add_argument("--max_queries", type=int, default=0)
+    ap.add_argument("--zip_step", type=int, default=5)
+    ap.add_argument("--reload_every", type=int, default=25)
     args = ap.parse_args()
 
     asyncio.run(
